@@ -14,6 +14,8 @@ Everything below was observed on 2026-10-09 against `AmadeusITGroup/dataspace-ec
 
 ## Contents
 
+**Part I — What runs and how it is configured**
+
 1. [The big picture: seven layers](#1-the-big-picture-seven-layers)
 2. [Docker and container images](#2-docker-and-container-images)
 3. [Java, Gradle and the image build](#3-java-gradle-and-the-image-build)
@@ -35,7 +37,23 @@ Everything below was observed on 2026-10-09 against `AmadeusITGroup/dataspace-ec
 19. [Security posture](#19-security-posture)
 20. [Local vs. devbox (AWS) vs. target architecture](#20-local-vs-devbox-aws-vs-target-architecture)
 21. [Troubleshooting cookbook](#21-troubleshooting-cookbook)
-22. [Further reading](#22-further-reading)
+
+**Part II — Where every configuration comes from**
+
+22. [The configuration chain](#22-the-configuration-chain)
+23. [Inventory of source files](#23-inventory-of-source-files)
+24. [Tracing values end to end](#24-tracing-values-end-to-end)
+25. [Provenance by component](#25-provenance-by-component)
+26. [Secrets and keys: who creates what](#26-secrets-and-keys-who-creates-what)
+27. [What the deployment does not create](#27-what-the-deployment-does-not-create)
+28. [Creation order](#28-creation-order)
+
+**Part III — How it is done, and how to change it**
+
+29. [What each command does inside](#29-what-each-command-does-inside)
+30. [How an EDC runtime boots](#30-how-an-edc-runtime-boots)
+31. [Recipes](#31-recipes)
+32. [Further reading](#32-further-reading)
 
 ---
 
@@ -430,7 +448,7 @@ The whole values tree is built in HCL and serialised with `yamlencode`, so the T
 - a **Deployment** whose env vars come from values (`EDC_PARTICIPANT_ID`, `EDC_VAULT_HASHICORP_URL`, `EDC_DATASOURCE_DEFAULT_URL`…; section 9);
 - a **Service** with one port per entry in `endpoints` (default, management, protocol, control…);
 - an **Ingress** (section 6);
-- a **ConfigMap `<release>-config`** with three files mounted under `/app`: `config.properties` (extra EDC settings, `EDC_FS_CONFIG=/app/config.properties`), `logging.properties` (`.level=DEBUG`, `org.eclipse.edc.level=ALL`, which is very verbose) and `opentelemetry.properties` (agent disabled).
+- a **ConfigMap `<release>-config`** with three files mounted under `/app`: `config.properties` (extra EDC settings, `EDC_FS_CONFIG=/app/config.properties`), `logging.properties` (set per component in Terraform: `.level=DEBUG` on control planes, participant identity hubs, the issuer and the three telemetry/billing services; `.level=INFO` on data planes and telemetry agents; the federated catalog, its filter and the authority identity hub have the block commented out and use the chart's default. Where set, `org.eclipse.edc.level=ALL` makes it very verbose) and `opentelemetry.properties` (agent disabled).
 
 The Vault chart is configured with `injector.enabled=false`, `server.standalone.enabled=true` with a custom HCL config (section 12), `server.dev.enabled=false`, readiness probe disabled, and `wait_for_jobs=true` on the release.
 
@@ -548,7 +566,7 @@ Issues credentials. It holds **holders** (registered participants), **attestatio
 ### Telemetry (`<p>-telemetryagent`, `authority-telemetry*`)
 
 - **Agent**: reads consumption records from its participant DB, gets a SAS token from the telemetry service (`/api/credential/v1alpha/sas-token`, request signed with the participant DID), and publishes to Event Hub `eh1` in namespace `local-eventhub-eventhubs`.
-- **Service**: verifies that the requester is onboarded and mints the SAS token from the `event-hub-connection-string` secret in the authority Vault. The E2E suite writes that secret during setup.
+- **Service**: verifies that the requester is onboarded and mints the SAS token from the `event-hub-connection-string` secret in the authority Vault. Terraform only configures the **alias** (`telemetryservice.tf`, `connection_string_alias`); the **value** is written by the E2E suite during setup. On a fresh deployment without the suite the secret does not exist, so the telemetry service cannot mint tokens and the agents cannot publish (recipe 31.9 writes it by hand).
 - **Storage**: `POST /telemetry-events` into `billingdb`.
 - **CSV manager**: `POST /billing-reports` generates a month's report per participant (cross-checking both sides of each contract); `GET` returns it as CSV for the JWT role `Participant.<name>`. Reports are stored in `azurite-report-storage`.
 
@@ -556,7 +574,7 @@ In production an Azure Function moves events from Event Hub to storage. Nothing 
 
 ### Backend (`provider-backend`)
 
-A small HTTP app (image `backend-service-provider`, port 8080) used as the asset source: `/api/provider/data` echoes query params, `/api/provider/oauth2data` requires an OAuth2 token from `/api/oauth2/token`, and `/api/provider/failure` returns 500.
+A small HTTP app (image `backend-service-provider`, port 8080) used as the asset source: `/api/provider/data` echoes query params, `/api/provider/oauth2data` requires an OAuth2 token from `/api/oauth2/token`, and `/api/provider/failure` returns 500. It is itself a tiny EDC runtime: one extension (`system-tests/backend-service-provider/src/.../ProviderBackendServiceExtension.java`) registering `ProviderBackendApiController` and `ProviderOauth2TokenController`, deployed by Terraform as a plain Deployment + Service (`modules/backend-service/main.tf`), not through Helm.
 
 ---
 
@@ -743,7 +761,7 @@ Why nip.io does not work out of the box (Host must be `localhost`), and why expo
 | Step | Function | What and why |
 | --- | --- | --- |
 | 1 | `check_prereqs` | docker, kind, kubectl, terraform, git, and a running Docker daemon. A host JDK is checked only when building on the host |
-| 2 | `clone_or_update` | Clone `dataspace-ecosystem`, or `git pull --ff-only` (never overwrites local changes) |
+| 2 | `ensure_mvd_repo` | Use the git submodule `ging_deploy/dataspace-ecosystem` (initialised if empty, never pulled: the parent repo pins the commit). Only without the submodule does it clone into `$WORKDIR` or `git pull --ff-only` |
 | 3 | `ensure_kind_cluster` | Create the cluster with the generated config (127.0.0.1 binding). If it already exists, warn when its binding differs. **Pin the kubectl context** to `kind-<name>` so nothing hits another cluster |
 | 4 | `install_ingress_nginx` | Apply the kind manifest, wait for the pod to exist, then `kubectl wait` for ready |
 | 5 | `build_and_load_images` | Containerised Gradle build, then retag each image as `localhost/` and `kind load` both names. The image list matches exactly what Terraform references |
@@ -829,7 +847,535 @@ The devbox runbooks deal with the same weak points described in this report (job
 
 ---
 
-## 22. Further reading
+# Part II — Where every configuration comes from
+
+Part I described what runs and how it is configured. This part answers a different question: **for each piece of configuration that ends up in a pod, which file produced it, and through which steps.** Every running object can be traced back to one of four sources:
+
+| Source | Lives in | Examples |
+| --- | --- | --- |
+| **This repo** (`ging_deploy/`) | `rc.sh`, `deploy-local-mvd.sh` | cluster name, listen address, TLS on/off, build image, ports of the port-forwards |
+| **Upstream repo** (git submodule `ging_deploy/dataspace-ecosystem`, pinned to `e0c5200`) | `system-tests/*.tf`, `charts/*`, `launchers/*/Dockerfile`, `build.gradle.kts`, `gradle.properties` | every Kubernetes object, every EDC setting, every image |
+| **Third parties, fetched at deploy time** | the ingress-nginx manifest URL, the HashiCorp Helm repo, public images (`postgres`, `hashicorp/vault`, `mcr.microsoft.com/*`) | ingress controller, Vault chart, infra images |
+| **Runtime, through APIs** (not configuration at all) | the issuer admin API, Management APIs, Vault API, the E2E suite | holders, attestations, credentials, assets, some Vault secrets |
+
+The last row is easy to forget: a fresh deployment is mostly empty, and much of what you see in a working dataspace was **written by API calls**, not by any file (section 27).
+
+---
+
+## 22. The configuration chain
+
+```mermaid
+flowchart TB
+    RC["ging_deploy/rc.sh<br/>(exported env vars)"] --> SH["deploy-local-mvd.sh"]
+    SH -->|"writes $WORKDIR/kind.config.yaml"| KIND["kind create cluster"]
+    SH -->|"kubectl apply URL"| ING["ingress-nginx manifest (upstream)"]
+    SH -->|"docker run eclipse-temurin:17-jdk"| GR["gradle: build.gradle.kts + gradle.properties + launchers/*/build.gradle.kts"]
+    GR --> DF["launchers/*/Dockerfile<br/>(base image, JRE, ENV WEB_HTTP_* ports, CMD)"]
+    DF --> IMG["images &lt;name&gt;:latest → retag localhost/ → kind load"]
+    SH -->|"-var environment, tls_enabled, kube_context"| VARS["system-tests/variables.tf"]
+    VARS --> ROOT["system-tests/main.tf<br/>(participants list, TLS CA/cert)"]
+    ROOT --> MODS["system-tests/modules/*/<br/>locals: names, DIDs, URLs, image refs, aliases, passwords"]
+    MODS -->|"kubernetes_* resources"| K8S1["Secrets, ConfigMaps, StatefulSets,<br/>Jobs, Services, Vault Ingress"]
+    MODS -->|"helm_release values = yamlencode({...})"| HV["Helm values"]
+    CHV["charts/&lt;chart&gt;/values.yaml<br/>(defaults: probes, endpoints, resources)"] --> MERGE
+    HV --> MERGE["Helm merge: Terraform values override chart defaults"]
+    MERGE --> TPL["charts/&lt;chart&gt;/templates/<br/>_helpers.tpl · deployment.yaml · config.yaml · service.yaml · ingress.yaml"]
+    TPL --> K8S2["Deployment (env vars, probes)<br/>ConfigMap &lt;release&gt;-config<br/>Service · Ingress"]
+    K8S2 --> POD["container"]
+    IMG --> POD
+    K8S1 --> POD
+    POD --> EDC["EDC settings resolved from:<br/>/app/config.properties ← EDC_FS_CONFIG<br/>environment (EDC_*, WEB_HTTP_* from Dockerfile)<br/>JVM system properties"]
+```
+
+Reading the chain from the bottom up:
+
+1. **The JVM** reads its settings from three places: the file named by `EDC_FS_CONFIG` (`/app/config.properties`), environment variables, and system properties. Environment variables include the `WEB_HTTP_*` defaults baked into the image.
+2. **The container** gets its environment from the Deployment, and `/app/config.properties`, `logging.properties` and `opentelemetry.properties` from the ConfigMap `<release>-config`, mounted under `/app`.
+3. **The Deployment and ConfigMap** are rendered by the chart's templates from the merged values.
+4. **The values** are chart defaults (`values.yaml`) overridden by what Terraform passes in `helm_release.values`, built in HCL and serialised with `yamlencode`.
+5. **Terraform** computes those values from module `locals` (naming conventions, DIDs, URLs) and variables (`environment`, `tls_enabled`, names).
+6. **The script** decides the Terraform variables, the kind config and the build, from `rc.sh`.
+
+Things that skip Helm entirely (Postgres, Vault init and keygen jobs, the Vault ingress, Event Hubs, Azurite, the provider backend, database jobs) are `kubernetes_*` resources written directly in the Terraform modules.
+
+**One trap in this chain: ports.** The port each EDC runtime listens on comes **only** from `ENV WEB_HTTP_<CONTEXT>_PORT` in its Dockerfile. The chart's `endpoints.*.port` values feed the `containerPort`, the Service, the probes and the Ingress, but no chart template passes them to the JVM (there is no `WEB_HTTP_*` in any `deployment.yaml`). Changing a port therefore means changing both places (recipe 31.6).
+
+---
+
+## 23. Inventory of source files
+
+### This repo (`ging_deploy/`)
+
+| File | Produces |
+| --- | --- |
+| `rc.sh` | Exported variables: `WORKDIR`, repo URLs, `KIND_CLUSTER_NAME`, `KIND_LISTEN_ADDRESS`, `TLS_ENABLED`, `BUILD_IN_CONTAINER`, `GRADLE_BUILD_IMAGE`, `RUN_E2E_TESTS`, `START_UI`, `UI_ROLE`, port-forward ports, `POD_WAIT_TIMEOUT`, `JAVA_HOME` |
+| `deploy-local-mvd.sh` | `$WORKDIR/kind.config.yaml` (generated each time a cluster is created), the image list for retag/load, the Terraform `-var`s, port-forwards, logs in `$WORKDIR/logs/` |
+| `tutorial/dataspace.py` | Not deployment config: helper constants for the notebooks (base URL, contexts) |
+
+### Upstream repo (`dataspace-ecosystem`, commit `e0c5200`)
+
+**Build**
+
+| File | Produces |
+| --- | --- |
+| `settings.gradle.kts` | The list of Gradle projects: every launcher (`launchers/<component>/<component>-base`, `-postgresql-hashicorpvault`, `-postgresql-azurevault`), every extension, the system tests |
+| `build.gradle.kts` (root) | Plugin versions (shadow 8.1.1, bmuschko docker 9.3.4, edc-build 1.1.5), and for every launcher with a Dockerfile the tasks `dockerize`, `podmanize`, `loadToKind`, `downloadOtel`/`copyOtel` and their build args |
+| `gradle.properties` | `version=0.16.0`, `edcGradlePluginsVersion=1.1.5`, `vaultType=hashicorp`, `registryUrl=quay.io/centos`, `baseImage=centos:latest`, `installJava=true` |
+| `gradle/libs.versions.toml` | Library versions: `edc = 0.16.1`, `edc-ih/edc-is/edc-fc = 0.16.0`, Jetty, Jackson, BouncyCastle… |
+| `launchers/<c>/<c>-base/build.gradle.kts` | **What a runtime contains**. For the control plane: DSE extensions (participant-context-config-seed, policies, odrl-policy-did-validation, agreements, metrics, asset-custom-property-subscriber, asset-property-lookup, control-plane-federated-catalog-filter, contract-validation), the secrets API, the EDC connector bundle and control-plane BOM, DSP |
+| `launchers/<c>/<c>-postgresql-hashicorpvault/build.gradle.kts` | Adds the SQL stores (`edc.controlplane.sql.bom`), the HashiCorp Vault client (`edc.ext.vault.hashicorp`), and DSE SQL stores (for example `retirement-evaluation-store-sql`) on top of the base |
+| `launchers/<c>/<c>-postgresql-hashicorpvault/Dockerfile` | Base image, JRE 21, openssl, user 1000, the jar, the OpenTelemetry agent, **`ENV WEB_HTTP_*` (listening ports and paths)**, `CMD java …` |
+| `system-tests/backend-service-provider/` | The sample backend: its own Gradle project, Dockerfile and three Java classes |
+
+**Terraform (`system-tests/`)**
+
+| File | Lines | Produces |
+| --- | --- | --- |
+| `providers.tf` | 29 | Provider requirements and configuration (kubeconfig path + context) |
+| `variables.tf` | 114 | Root variables: names, `kube_context`, `environment`, Azurite keys, devbox registry, Kafka-proxy auth, `tls_enabled`, `vault_folder` |
+| `main.tf` | 227 | `local.participants = [provider, consumer]`; TLS CA, wildcard certificate and the two TLS Secrets (only with TLS); calls to every module |
+| `kind.config.yaml` | 17 | The upstream kind config. Not used by the script, which writes its own with `listenAddress` |
+| `modules/postgres/main.tf` + `config/postgresql.conf` | 173 | Secret `postgresql`, ConfigMap `postgresql`, StatefulSet `postgresql`, Service `postgres` |
+| `modules/db/main.tf` + `db_init.sh` | 112 | ConfigMap `<user>-db-init` (the script) and Job `<user>-db-init`: one user + one database |
+| `modules/vault/main.tf` | 368 | Helm release `<p>-vault`, Secret `<p>-vault` (root token), Ingress `<p>-vault-ingress`, Jobs `<p>-vault-init-job` and `<p>-vault-keygen-job`, the participant key pair (`tls_private_key`) |
+| `modules/participant/main.tf` | 70 | Shared locals (aliases, DB name/user/password, `authority_did`, pull policy, scheme, TLS helpers), keystore Secret, calls to `db` and `vault`, Secret `<p>-db-credentials` |
+| `modules/participant/controlplane.tf` | 193 | Helm release `<p>-controlplane` and the DSP URLs |
+| `modules/participant/dataplane.tf` | 175 | Helm release `<p>-dataplane`, public URL, data plane selector URL |
+| `modules/participant/identityhub.tf` | 195 | Helm release `<p>-identityhub`: DID, STS URL and client secret alias, **the services published in the DID document** |
+| `modules/participant/telemetryagent.tf` | 169 | Helm release `<p>-telemetryagent`, Event Hub namespace/name (hardcoded) |
+| `modules/participant/variables.tf` | 194 | Participant defaults: state machine waits (negotiation 2000 ms, transfer 2000 ms, policy monitor 5000 ms, data plane 5000 ms), DSE prefixes (`dse`, `dse-policy`), keystore password `changeit`, `selfhosted_*` overrides |
+| `modules/participant/standalone-providers.tf.disabled` | 27 | Disabled: providers for deploying a single participant against an existing cluster |
+| `modules/authority/main.tf` | 96 | Authority locals, the `db` module twice (`authoritydb`, `billingdb`), the `eventhub` module, DB credential Secrets |
+| `modules/authority/identityhub.tf` | 210 | Helm release `authority-identityhub` and **the five services of the authority DID** |
+| `modules/authority/issuerservice.tf` | 174 | Helm release `authority-issuerservice`, `domain: "route"`, status list callback |
+| `modules/authority/catalog.tf` | 168 | Helm release `authority-federatedcatalog`, crawler `initial_delay = 10`, `execution_period = 10` |
+| `modules/authority/federatedcatalogfilter.tf` | 158 | Helm release `authority-federatedcatalogfilter`, filter URL |
+| `modules/authority/telemetryservice.tf` | 162 | Helm release `authority-telemetryservice`, `connection_string_alias = "event-hub-connection-string"` |
+| `modules/authority/telemetrystorage.tf` | 231 | Helm release `authority-telemetrystorage`, ConfigMap `billing-db-insert-script` (from `insert_rows.sh`), Job `billing-db-insert` |
+| `modules/authority/telemetrycsvmanager.tf` | 135 | Helm release `authority-telemetrycsvmanager`, Azurite connection string, container `reports` |
+| `modules/authority/insert_rows.sh` | 8 | Two hardcoded rows in `billingdb.participant_id` (provider, consumer) |
+| `modules/authority/registry.tf` | 111 | **Entirely commented out**: a former nginx "participants registry". Dead code |
+| `modules/authority/eventhub/eventhub.tf` | — | ConfigMap `eventhubs-config` (`Config.json`), StatefulSet + Service `eventhubs` (emulator 2.1.0) |
+| `modules/authority/eventhub/azurite.tf` | — | StatefulSets + Services `azurite`, `azurite-report-storage` (Azurite 3.35.0), Job `create-blob-container` |
+| `modules/azurite-blobstorage/main.tf` | 176 | StatefulSet + Service `azurite-blobstorage`, Job `create-blobstorage-containers` |
+| `modules/backend-service/main.tf` | 79 | Deployment + Service `provider-backend` |
+
+**Helm charts (`charts/`)**
+
+Every EDC chart has the same layout: `Chart.yaml`, `values.yaml` (defaults), `templates/_helpers.tpl` (naming, URLs, image repository, secret names, `configProperties`), `deployment.yaml` (env vars, probes, volumes, init containers), `config.yaml` (the ConfigMap), `service.yaml`, `ingress.yaml`, `hpa.yaml`, `serviceaccount.yaml`, `NOTES.txt` and `tests/`.
+
+| Chart | Notes |
+| --- | --- |
+| `control-plane`, `data-plane`, `identity-hub`, `issuer-service`, `federated-catalog`, `federated-catalog-filter`, `telemetry-service`, `telemetry-storage`, `telemetry-csv-manager` | Standard layout |
+| `telemetry-agent` | **No `ingress.yaml`**, which is why the agents have no Ingress even though Terraform passes ingress values |
+| `participant` | Only `routes.yaml` + `NOTES.txt`: an umbrella not used by the local Terraform |
+| `telemetry/` | Elasticsearch-based telemetry stack, not used locally |
+
+### Third parties
+
+| What | Where it comes from | Pinned? |
+| --- | --- | --- |
+| ingress-nginx | `https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml` (script) | No (`main`) |
+| Vault chart | `https://helm.releases.hashicorp.com`, chart `vault` `v0.28.1` (`modules/vault/main.tf`) | Yes |
+| Vault image (server + jobs) | chart default `hashicorp/vault:1.17.2`; the jobs use `hashicorp/vault` (latest) | Server yes, jobs no |
+| Postgres | `postgres:15.3-alpine3.18` (`modules/postgres`, `modules/db`) | Yes |
+| Event Hubs emulator | `mcr.microsoft.com/azure-messaging/eventhubs-emulator:2.1.0` | Yes |
+| Azurite | `mcr.microsoft.com/azure-storage/azurite:3.35.0` | Yes |
+| Azure CLI (container jobs) | `mcr.microsoft.com/azure-cli:2.84.0` | Yes |
+| Base image of every EDC image | `quay.io/centos/centos:latest` (`gradle.properties`) | No |
+| kind node | `kindest/node:v1.33.1` (kind v0.29 default) | By kind version |
+| Build JDK | `eclipse-temurin:17-jdk` (`rc.sh`) | Major only |
+
+---
+
+## 24. Tracing values end to end
+
+Nine values, followed from the pod back to the line that created them.
+
+### 24.1 `EDC_PARTICIPANT_ID` of `provider-controlplane`
+
+```
+pod env EDC_PARTICIPANT_ID = did:web:provider-identityhub%3A8383:api:did
+  ← charts/control-plane/templates/deployment.yaml      value: {{ include "dse.controlplane.identityHubDidWebUrl" . }}
+  ← charts/control-plane/templates/_helpers.tpl          .Values.controlplane.did.web.url (or global.identityHub.didWebUrl)
+  ← modules/participant/controlplane.tf                  "did": {"web": {"url": local.did_url}}
+  ← modules/participant/identityhub.tf                   local.did_url = "did:web:${local.identityhub_release_name}%3A8383:api:did"
+  ← modules/participant/identityhub.tf                   local.identityhub_release_name = "${var.participant_name}-identityhub"
+  ← system-tests/main.tf                                 participant_name = each.key  (for_each over local.participants)
+  ← system-tests/variables.tf                            provider_name default = "provider"
+```
+
+The `8383` in the DID is a literal in `identityhub.tf`. It must match the identity hub's DID port, which comes from its Dockerfile (`ENV WEB_HTTP_DID_PORT="8383"`), and the E2E tests hardcode it again (`ParticipantConstants.IDENTITY_HUB_DID_PORT = 8383`).
+
+### 24.2 `EDC_DSP_CALLBACK_ADDRESS` (where the other connector sends its DSP replies)
+
+```
+pod env EDC_DSP_CALLBACK_ADDRESS = http://provider-controlplane:8282/api/dsp
+  ← deployment.yaml  {{ include "dse.controlplane.url.protocol" . }}
+  ← _helpers.tpl     uses .Values.controlplane.url.protocol if set; otherwise builds it from the ingress hostname
+  ← controlplane.tf  "url": {"protocol": local.protocol_callback_url}
+  ← controlplane.tf  local.protocol_callback_url = "${local.scheme}://${local.controlplane_release_name}:8282/api/dsp"
+  ← participant/main.tf  local.scheme = var.tls_enabled ? "https" : "http"
+```
+
+Terraform sets `url.protocol` explicitly to the **in-cluster** name, which is why DSP never goes through the ingress (with the comment "*In the case of this MVD we use internal routes for simplicity*"). If `url.protocol` were left empty, the helper would derive it from the ingress hostname (`localhost`), which would not work between pods.
+
+### 24.3 The provider's private key
+
+```
+Terraform: modules/vault/main.tf  resource "tls_private_key" "key-pair" { algorithm = "ECDSA", ecdsa_curve = "P256" }
+  → Terraform state (system-tests/terraform.tfstate) — the PEM is stored there in clear
+  → modules/vault/main.tf  kubernetes_job "vault-keygen-job": the PEM is inlined into the job's shell command:
+        vault kv put secret/provider     content="<private PEM>"
+        vault kv put secret/provider-pub content="<public PEM>"
+        vault kv put secret/provider-aes content="<random 32 bytes, base64>"
+  → Vault (in memory) at secret/provider, secret/provider-pub, secret/provider-aes
+Consumers, by alias:
+  identity hub   keys.sts.privateKeyAlias = local.privatekey_alias ("provider")       ← identityhub.tf
+                 → key pair resource did:...#my-key, published in the DID document
+  data plane     keys.dataplane.privateKeyVaultAlias = "provider" (EDR token signer)  ← dataplane.tf
+                 → env EDC_TRANSFER_PROXY_TOKEN_SIGNER_PRIVATEKEY_ALIAS=provider
+                 publicKeyVaultAlias = "provider-pub"  → …VERIFIER_PUBLICKEY_ALIAS=provider-pub
+  every runtime  EDC_ENCRYPTION_AES_KEY_ALIAS = "provider-aes"
+```
+
+The PEM is also visible in the job's pod spec (`kubectl get job provider-vault-keygen-job -o yaml`) until the job is deleted, one hour after completion.
+
+### 24.4 The Vault token every runtime uses
+
+```
+modules/vault/main.tf   local.vault_token = "root"
+  → kubernetes_secret "<p>-vault"  data = { rootToken = "root" }
+  → kubernetes_job "<p>-vault-init-job":  vault token create -id="root" -policy=root
+                                          (after operator init + unseal + kv-v2 enable)
+  → module output vault_secret_name / vault_url
+  → controlplane.tf  "vault": {"hashicorp": {"url": module.vault.vault_url,
+                     "token": {"secret": {"name": module.vault.vault_secret_name, "tokenKey": "rootToken"}}}}
+  → deployment.yaml  EDC_VAULT_HASHICORP_TOKEN  valueFrom.secretKeyRef {name: <p>-vault, key: rootToken}
+```
+
+The init job creates a token **with a known id**. That way the Secret written by Terraform before Vault even exists already holds a valid token by the time the runtimes start.
+
+### 24.5 Database credentials
+
+```
+participant/main.tf   local.db_name = "${participant}db", db_user = participant, db_user_password = "${participant}pwd"
+  → module "db": Job <p>-db-init, env DB_USER/DB_NAME/DB_PASSWORD + admin creds from Secret "postgresql"
+        → db_init.sh: CREATE USER …; CREATE DATABASE … OWNER …; GRANT …
+  → kubernetes_secret "<p>-db-credentials" { username, password }
+  → controlplane.tf "postgresql": {"jdbcUrl": "jdbc:postgresql://postgres/<p>db", "credentials": {"secret": {"name": "<p>-db-credentials"}}}
+  → deployment.yaml EDC_DATASOURCE_DEFAULT_URL / _USER / _PASSWORD (secretKeyRef)
+  → EDC_SQL_SCHEMA_AUTOCREATE=true: each SQL store runs its CREATE TABLE IF NOT EXISTS on boot
+```
+
+The admin password `postgres` comes from `modules/postgres/main.tf` (`local.pg_password`).
+
+### 24.6 The services in a DID document
+
+```
+GET /provider/ih/did/did.json → service: [DSPMessaging, CredentialService]
+  ← identity hub runtime: DID document stored in did_resources (providerdb) and served on :8383/api/did
+  ← super-user seed extension (extensions/identity-hub/superuser-seed): at boot, creates the participant context
+     with the configured key + services and publishes the DID
+  ← chart identity-hub: values identityhub.participantcontext.superuser.services → setting read by the seed
+  ← modules/participant/identityhub.tf:
+        "participantcontext": {"superuser": {"key": "<did base64url>.root",
+          "services": jsonencode([{id: "dsp-url", type: "DSPMessaging", serviceEndpoint: local.protocol_url},
+                                  {id: "credential-service-url", type: "CredentialService", serviceEndpoint: ".../api/credentials/v1/participants/<b64>"}])}}
+```
+
+The authority's five services (`CredentialService`, `IssuerService`, `TelemetryServiceCredential`, `FederatedCatalogFilterService`, `FederatedCatalogService`) come from the same block in `modules/authority/identityhub.tf`. That is how other runtimes **discover** the issuer, the catalog filter and the telemetry service: by resolving the authority DID, not through a configured URL.
+
+### 24.7 The ingress route `/provider/cp/management`
+
+```
+nginx rule: host localhost, path /provider/cp/(management)(.*) → provider-controlplane:8181, rewrite /api/$1$2
+  ← charts/control-plane/templates/ingress.yaml   rules[0].host = .hostname; paths from .endpoints; service = fullname
+  ← controlplane.tf "ingress": {"enabled": true, "className": "nginx", "hostname": "localhost",
+        "annotations": {... "rewrite-target": "/api/$1$2", "use-regex": "true", backend-protocol …},
+        "endpoints": [{"port": 8181, "path": "${var.participant_with_prefix}/cp/(management)(.*)"}, …]}
+  ← main.tf  participant_with_prefix = "/${each.key}"
+```
+
+The Vault routes do not come from a chart: `modules/vault/main.tf`, resource `kubernetes_ingress_v1.vault-ingress`, path `/<p>/vault(/|$)(.*)`, rewrite `/$2`.
+
+### 24.8 Who the federated catalog crawls
+
+```
+crawler targets ← participant-registry-node-directory extension: holderStore.query(QuerySpec.max())
+                ← table of holders in authoritydb
+                ← written by POST /authority/is/issueradmin/.../holders   (flow A2, an API call)
+crawl timing    ← catalog.tf locals crawler_initial_delay = 10, crawler_execution_period = 10
+                → env EDC_CATALOG_CACHE_EXECUTION_DELAY_SECONDS / _PERIOD_SECONDS, EDC_CATALOG_CACHE_LOADER_BATCH_SIZE=1
+```
+
+The crawl **list** is not configuration. Until someone registers holders, the federated catalog crawls nobody.
+
+### 24.9 The trusted issuer of a participant
+
+```
+config.properties  edc.iam.trusted-issuer.authority.id = did:web:authority-identityhub%3A8383:api:did
+  ← chart control-plane _helpers.tpl "dse.controlplane.configProperties":  edc.iam.trusted-issuer.authority.id={{ authorityDid }}
+  ← controlplane.tf "trustedIssuers": {"authority": {"did": local.authority_did}}   (and the same line again in its "config" heredoc)
+  ← participant/main.tf  local.authority_did = var.selfhosted_authority_did != "" ? … : replace(local.did_url, var.participant_name, "authority")
+```
+
+The authority DID is computed by **string replacement** on the participant's own DID (`provider` → `authority`). That works only because of the naming convention. A participant named, say, `providerx` would get `authorityx`, because `replace` substitutes every occurrence. The `selfhosted_authority_did` variable exists to override it.
+
+---
+
+## 25. Provenance by component
+
+For each runtime: its Terraform file, its chart, and where its notable settings come from. `<p>` = provider or consumer.
+
+| Runtime | Terraform | Chart | Image (local) | Notable settings and their origin |
+| --- | --- | --- | --- | --- |
+| `<p>-controlplane` | `participant/controlplane.tf` | `control-plane` | `localhost/control-plane-postgresql-hashicorpvault` | DSP callback (24.2), STS client (`sts.tokenUrl/clientId/clientSecretAlias` from `identityhub.tf` locals), trusted issuer (24.9), state machine waits (`participant/variables.tf`), DSE prefixes, logging DEBUG |
+| `<p>-dataplane` | `participant/dataplane.tf` | `data-plane` | `localhost/data-plane-postgresql-hashicorpvault` | `public_url = http://<p>-dataplane:8181/api/public/`, `dpf_selector_url = http://<p>-controlplane:8383/api/control/v1/dataplanes`, token signer/verifier aliases (24.3), state machine 5000 ms, logging INFO |
+| `<p>-identityhub` | `participant/identityhub.tf` | `identity-hub` | `localhost/identity-hub-postgresql-hashicorpvault` | DID (24.1), STS keys, super-user context and services (24.6), credentials URL |
+| `<p>-telemetryagent` | `participant/telemetryagent.tf` | `telemetry-agent` | `localhost/telemetry-agent-postgresql-hashicorpvault` | Event Hub `local-eventhub-eventhubs`/`eh1` (hardcoded locals), authority DID, STS client, logging INFO |
+| `<p>-vault` | `vault/main.tf` | HashiCorp `vault` 0.28.1 | `hashicorp/vault:1.17.2` | Standalone, `storage "inmem"`, TLS listener only with TLS, readiness probe off |
+| `authority-identityhub` | `authority/identityhub.tf` | `identity-hub` | as above | Five DID services (24.6) |
+| `authority-issuerservice` | `authority/issuerservice.tf` | `issuer-service` | `localhost/issuer-service-postgresql-hashicorpvault` | `domain: "route"`, `EDC_STATUSLIST_CALLBACK_ADDRESS=http://authority-issuerservice:9999/api/statuslist`, status list signing alias `authority`, datasources `default` + `membership` on `authoritydb` |
+| `authority-federatedcatalog` | `authority/catalog.tf` | `federated-catalog` | `localhost/federated-catalog-postgresql-hashicorpvault` | Crawler timing (24.8) |
+| `authority-federatedcatalogfilter` | `authority/federatedcatalogfilter.tf` | `federated-catalog-filter` | `localhost/federated-catalog-filter-postgresql-hashicorpvault` | `filter_url = http://authority-federatedcatalogfilter.default.svc.cluster.local:8383/api/catalogfilter/filter`, trusted issuer |
+| `authority-telemetryservice` | `authority/telemetryservice.tf` | `telemetry-service` | `localhost/telemetry-service-postgresql-hashicorpvault` | `eventhub.connectionstring.alias = event-hub-connection-string` (value: section 27) |
+| `authority-telemetrystorage` | `authority/telemetrystorage.tf` | `telemetry-storage` | `localhost/telemetry-storage` | Datasources on `billingdb`; job `billing-db-insert` after the release |
+| `authority-telemetrycsvmanager` | `authority/telemetrycsvmanager.tf` | `telemetry-csv-manager` | `localhost/telemetry-csv-manager` | Blob connection string `…AccountName=user;AccountKey=pass;BlobEndpoint=http://azurite-report-storage:10000/user;`, container `reports`, **no JWT verification setting** |
+| `provider-backend` | `backend-service/main.tf` | none | `localhost/backend-service-provider` | Port 8080, liveness `/api/check/liveness` |
+| `postgresql` | `postgres/main.tf` | none | `postgres:15.3-alpine3.18` | `postgresql.conf` from `postgres/config/`, admin creds in Secret `postgresql`, no volume |
+| `eventhubs` | `authority/eventhub/eventhub.tf` | none | emulator 2.1.0 | `Config.json` inline in the ConfigMap; blob/metadata on `azurite` |
+| `azurite`, `azurite-report-storage` | `authority/eventhub/azurite.tf` | none | Azurite 3.35.0 | Accounts `user`/`pass` (root `variables.tf`) |
+| `azurite-blobstorage` | `azurite-blobstorage/main.tf` | none | Azurite | Well-known `devstoreaccount1` key (root `variables.tf`) |
+
+---
+
+## 26. Secrets and keys: who creates what
+
+### Kubernetes Secrets
+
+| Secret | Created by | Content | Used by |
+| --- | --- | --- | --- |
+| `postgresql` | `postgres/main.tf` | `POSTGRES_USER=postgres`, `POSTGRES_PASSWORD=postgres`, `POSTGRES_DB=postgres` | Postgres container, every db-init job, `billing-db-insert` |
+| `<p>-db-credentials`, `authority-db-credentials` | `participant/main.tf`, `authority/main.tf` | `username=<p>`, `password=<p>pwd` | `EDC_DATASOURCE_DEFAULT_USER/PASSWORD` of every runtime of that participant |
+| `billinguser-db-credentials` | `authority/main.tf` | `billinguser` / `authoritypwd` | telemetry storage, CSV manager |
+| `<p>-vault` | `vault/main.tf` | `rootToken=root` | `EDC_VAULT_HASHICORP_TOKEN` of every runtime of that participant |
+| `internal-service-tls`, `nginx-proxy-ssl-ca` | `main.tf` (TLS only) | wildcard cert + key + CA / CA only | runtimes, Vaults, nginx |
+| `<p>-internal-keystore-credentials` | `participant/main.tf`, `authority/main.tf` (TLS only) | `password=changeit` | `EDC_WEB_HTTPS_KEYSTORE_PASSWORD` |
+| `sh.helm.release.v1.<release>.v1` | Helm | the release (values, manifest) | `helm get`, upgrades |
+
+### Vault keys (per participant, `secret/` KV v2)
+
+| Key | Created by | When |
+| --- | --- | --- |
+| `<p>`, `<p>-pub` | `vault-keygen-job` (PEM from Terraform `tls_private_key`) | deploy |
+| `<p>-aes` | `vault-keygen-job` (`head -c 32 /dev/urandom`) | deploy |
+| `<did>-sts-client-secret`, `<did>-apikey` | the identity hub, while seeding the super-user participant context | first boot of the identity hub |
+| `transfer-process-<id>-data-address` (provider) | the provider control plane, per transfer | each transfer |
+| `oauth-secret`, `devstoreaccount1`, `devstoreaccount1-key1` | E2E suite, through `POST /v3/secrets` | E2E run |
+| `event-hub-connection-string` (authority) | E2E suite, directly on the Vault API | E2E run |
+
+---
+
+## 27. What the deployment does not create
+
+After `up`, these things **do not exist** until an API call creates them. The notebooks, the Postman collection and the E2E suite are what create them:
+
+| Thing | Created by | Without it |
+| --- | --- | --- |
+| Holders (registered participants) | `POST …/issueradmin/…/holders` | Nobody can get credentials; **the federated catalog crawls nobody** |
+| Attestation and credential definitions | `POST …/attestations`, `…/credentialdefinitions` | The issuer cannot issue anything |
+| Membership / domain / visibility attestations | DSE attestation APIs | Issuance has no facts to put in the credentials |
+| Verifiable Credentials | Each wallet, `…/credentials/request` | **Every policy fails**: `dse-policy:Membership` needs a MembershipCredential |
+| Assets, policies, contract definitions | Provider Management API | Empty catalogs |
+| `event-hub-connection-string` in the authority Vault | E2E suite (or recipe 31.9) | Telemetry agents cannot get SAS tokens |
+| Backend secrets (`oauth-secret`, Azure keys) | `POST /v3/secrets` | The OAuth2 and blob assets fail |
+| Telemetry events in `billingdb` | Ingestion (absent locally), the E2E `@AfterAll`, or manual `POST /telemetry-events` | Reports are empty |
+
+What **is** created by configuration at boot: participant contexts and their DID documents (super-user seed), key pairs (identity hubs read them from Vault), the issuer's status list credential (on first issuance), database schemas (autocreate), the two `participant_id` rows in `billingdb` (`insert_rows.sh`), the blob containers (Azure CLI jobs), and the Event Hub `eh1` with its consumer group `cg1` (emulator `Config.json`).
+
+---
+
+## 28. Creation order
+
+Terraform builds a dependency graph from references and explicit `depends_on`, and runs up to 10 independent resources in parallel. `helm_release` waits for its pods to be ready, and the Vault release also waits for jobs (`wait_for_jobs = true`).
+
+```mermaid
+flowchart LR
+    TLS["TLS CA + certs + Secrets<br/>(only with TLS)"] --> PART
+    PG["postgres: Secret, ConfigMap,<br/>StatefulSet, Service"] --> DBJ["db-init jobs<br/>(authority, billing, provider, consumer)"]
+    VH["vault helm release"] --> VI["vault-init-job<br/>(init, unseal, kv-v2, token root)"]
+    VI --> VK["vault-keygen-job<br/>(keys + AES)"]
+    DBJ --> PART
+    VK --> PART
+    subgraph PART["per participant (provider, consumer)"]
+        CP["controlplane"] --> DP["dataplane"]
+        IH["identityhub"]
+        TA["telemetryagent"]
+    end
+    DBJ --> AUTH
+    VK --> AUTH
+    subgraph AUTH["authority"]
+        AIH["identityhub"]
+        IS["issuerservice"]
+        FC["federatedcatalog"]
+        FCF["federatedcatalogfilter"]
+        TS["telemetryservice"]
+        TST["telemetrystorage"] --> BDI["billing-db-insert job"]
+        CSV["telemetrycsvmanager"]
+    end
+    EH["eventhubs + azurite + azurite-report-storage"] --> CBC["create-blob-container job"]
+    AZB["azurite-blobstorage"] --> CBS["create-blobstorage-containers job"]
+    BE["provider-backend"]
+```
+
+Notes on the edges:
+
+- Every EDC release `depends_on = [module.vault, module.db]`, and the data plane also waits for its control plane (it registers itself through the control plane's selector API).
+- Nothing waits for the authority's identity hub before a participant starts. A connector that boots first simply fails DID resolutions until the authority is up, and recovers through retries.
+- `billing-db-insert` waits for the telemetry storage release, because the release's boot creates the `participant_id` table through schema autocreate.
+- Postgres, the backend and the emulators have no dependencies and start first.
+
+---
+
+# Part III — How it is done, and how to change it
+
+## 29. What each command does inside
+
+### `kind create cluster --config kind.config.yaml`
+
+1. Pulls `kindest/node:v1.33.1` and starts it as a privileged container named `dse-cluster-control-plane`, with the configured port mappings (`127.0.0.1:80/443 → 80/443`) and a random port for the API server.
+2. Inside the container, systemd starts containerd and the kubelet; `kubeadm init` runs with the config patch (the node label `ingress-ready=true`).
+3. kindnet (CNI), CoreDNS, kube-proxy and the local-path provisioner are installed.
+4. The kubeconfig entry `kind-dse-cluster` is written to `~/.kube/config` and made current.
+
+### `kubectl apply -f <ingress-nginx kind manifest>`
+
+Creates namespace `ingress-nginx`, RBAC, the admission webhook (with its two certgen jobs), the IngressClass `nginx` and the controller Deployment. Its nodeSelector (`ingress-ready=true`) and `hostPort: 80/443` pin it to the node and the host ports.
+
+### `./gradlew clean shadowJar dockerize`
+
+Per launcher project: `compileJava` → `jar` → `shadowJar` (merges every dependency into `build/shadow/<project>.jar`, with service files merged so all EDC extensions are discovered) → `downloadOtel` (fetches the OpenTelemetry Java agent once) → `copyOtel` → `dockerize` (`DockerBuildImage`: sends `build/` as the context to the Docker daemon with build args `JAR`, `OTEL_JAR`, `REGISTRY_URL`, `BASE_IMAGE`, `INSTALL_JAVA`, `INSTALL_OPENSSL`, and tags `<project>:latest`). In the containerised build, Docker is the **host** daemon (socket mount), so the images land on the host.
+
+### `kind load docker-image a:latest localhost/a:latest … --name dse-cluster`
+
+`docker save`s the images into a tar, copies it into the node and runs `ctr --namespace=k8s.io images import`. From then on the kubelet finds them locally, which is all `imagePullPolicy: Never` allows.
+
+### `terraform init / destroy / apply`
+
+- `init`: downloads providers into `system-tests/.terraform/` and creates `.terraform.lock.hcl`.
+- `destroy`: reads the state, refreshes it against the cluster, and deletes in reverse dependency order (`|| true` in the script, because there may be nothing).
+- `apply`: refresh → plan (diff of desired vs. state) → graph walk, 10 resources at a time. For `helm_release`, the Helm provider renders the chart with the merged values, stores the release Secret, applies the manifests and waits for readiness (default timeout 5 min). For `kubernetes_job`, it waits for completion if the resource says so. The result is written to `terraform.tfstate`.
+
+### Pod start-up (an EDC runtime)
+
+1. **Init containers** (TLS only): `keystore-setup` builds `/opt/ca/cacerts` and `keystore.p12` into a shared emptyDir.
+2. **Main container** starts `java -javaagent:… -jar controlplane.jar`.
+3. **Startup probe** (`/api/check/liveness`): first check after 10 s, every 10 s, up to 30 failures, so the runtime has up to about **5 minutes** to boot before Kubernetes kills it. Liveness and readiness only start after the startup probe succeeds.
+4. **Liveness** every 10 s, timeout 5 s, 3 failures → restart. **Readiness** every 10 s → added to or removed from the Service endpoints, and so from nginx.
+
+That is exactly what happened when the node was saturated: health checks that took longer than 5 s three times in a row restarted the pods (exit code 143 = SIGTERM).
+
+## 30. How an EDC runtime boots
+
+1. **Extension discovery**: EDC loads every `ServiceExtension` declared in the shaded jar's `META-INF/services` (that is what the launcher's dependency list decides), builds the dependency graph from `@Inject`/`@Provides`, and initialises them in order.
+2. **Settings**: each extension reads its `@Setting`s through the config system (file → environment → system properties). Unknown settings are ignored, so a typo in an env var name silently does nothing.
+3. **Web contexts**: for every `web.http.<context>.port/path` (from the Dockerfile `ENV`), a Jetty connector is opened. Controllers register on their context.
+4. **Vault**: the HashiCorp client is configured with the URL and token; with health checks on, it calls `/v1/sys/health`.
+5. **SQL**: data sources are created from `EDC_DATASOURCE_<NAME>_*`; with autocreate on, each store runs its schema script.
+6. **Seeds** (identity hubs, issuer): the super-user participant context is created with its key (alias in Vault) and services, and the DID document is published. `ParticipantContextConfiguration` entries are seeded.
+7. **State machines** start (negotiation, transfer, policy monitor, data plane, crawler…), each looping with its `iteration-wait-millis`.
+8. `/api/check/readiness` turns healthy, and the pod becomes Ready.
+
+## 31. Recipes
+
+Each recipe says which file to change and how to apply it. Unless noted, apply with `./deploy-local-mvd.sh up` (full redeploy) or, for Terraform-only changes, `terraform -chdir=system-tests apply -auto-approve -var=environment=local -var=tls_enabled=false -var=kube_context=kind-dse-cluster` from the upstream repo.
+
+### 31.1 Change one runtime's code and redeploy only that image
+
+```bash
+cd ging_deploy/dataspace-ecosystem
+docker run --rm -v "$PWD":/workspace -w /workspace -v /var/run/docker.sock:/var/run/docker.sock \
+  -v dse-gradle-cache:/root/.gradle eclipse-temurin:17-jdk \
+  ./gradlew --no-daemon :launchers:control-plane:control-plane-postgresql-hashicorpvault:dockerize
+docker tag control-plane-postgresql-hashicorpvault:latest localhost/control-plane-postgresql-hashicorpvault:latest
+kind load docker-image localhost/control-plane-postgresql-hashicorpvault:latest --name dse-cluster
+kubectl rollout restart deploy/provider-controlplane deploy/consumer-controlplane
+```
+
+The tag stays `latest` and the pull policy is `Never`, so a restart picks up the newly loaded image.
+
+### 31.2 Give the runtimes memory and CPU (stops the restarts under load)
+
+In each `helm_release` values block (for example `participant/controlplane.tf`, inside `"controlplane"`), add the values the chart's `values.yaml` already recommends:
+
+```hcl
+"resources" : { "requests" : { "cpu" : "250m", "memory" : "512Mi" }, "limits" : { "memory" : "768Mi" } }
+```
+
+Leave the CPU limit off, as the chart comment advises ("*no CPU limit to avoid JVM throttling*"). Apply with Terraform. With 16 JVMs, size Docker Desktop's memory accordingly.
+
+### 31.3 Change log levels
+
+Edit the `"logging" : <<EOT … EOT` heredoc of the component (`.level=INFO`, `org.eclipse.edc.level=INFO`). It becomes `logging.properties` in the ConfigMap. Apply with Terraform; the release has `recreate_pods = true`, so pods restart.
+
+### 31.4 Add a third participant
+
+1. `system-tests/variables.tf`: add a variable (or reuse the pattern) and append it to `local.participants` in `main.tf`.
+2. TLS only: add its bare host names to `dns_names` of `tls_cert_request.internal_service`.
+3. Apply. You get `<name>-controlplane`, `-dataplane`, `-identityhub`, `-telemetryagent`, `-vault`, database `<name>db` and ingress paths `/<name>/…`.
+4. At runtime: register it as a holder and give it attestations and credentials (flows A2–A4).
+5. Billing: add a row for it to `authority/insert_rows.sh` (provider and consumer are hardcoded there).
+
+Avoid names that contain another participant's name (24.9).
+
+### 31.5 Use a hostname other than `localhost` (nip.io, LAN)
+
+Replace `"hostname" : "localhost"` in the 11 Helm values blocks and `host`/`hosts` in `modules/vault/main.tf`, either with a single name (`127.0.0.1.nip.io`) or with `""` to drop the host (TLS off only). With TLS, add the name to the certificate's `dns_names`. For LAN access also set `KIND_LISTEN_ADDRESS=0.0.0.0` and recreate the cluster (`down` + `up`). See the README section "nip.io" for the tests behind this.
+
+### 31.6 Change a port
+
+1. The JVM: set `WEB_HTTP_<CONTEXT>_PORT`. Either rebuild the image with a new `ENV` in the Dockerfile, or add `web.http.<context>.port=<n>` to the component's `"config"` heredoc in Terraform. That file is read by EDC, but environment variables take precedence over it, so the Dockerfile `ENV` still wins; the reliable way is an `env` entry in the values (`"env" : {"WEB_HTTP_<CONTEXT>_PORT" : "<n>"}`).
+2. The chart: set the same port in `endpoints.<context>.port` (Service, containerPort, probes) and in the ingress `endpoints`.
+3. URLs that embed the port: DSP URLs in `controlplane.tf`, the DID (`%3A8383`) in `identityhub.tf`, the selector URL in `dataplane.tf`, and the E2E constants.
+
+### 31.7 Turn TLS on
+
+Set `TLS_ENABLED=true` in `rc.sh` and run `up`. Everything switches (section 15). Call the APIs with `https://localhost` (`curl -k`, the CA is self-signed). For the E2E suite use `TLS_ENABLED=true`.
+
+### 31.8 Make Vault and Postgres survive restarts
+
+- **Vault**: in `modules/vault/main.tf` replace `storage "inmem" {}` with `storage "file" { path = "/vault/data" }`. The chart already mounts its `data-<p>-vault-0` PVC there. But a restarted Vault comes back **sealed**, and the init job only handles first initialisation (it exits with "Vault is initialized but sealed. Manual intervention required"). You also need to store the unseal key (the job discards it) and unseal after restarts, or configure auto-unseal.
+- **Postgres**: add a `volume_claim_template` to the StatefulSet in `modules/postgres/main.tf` and mount it at `/data` (the `PGDATA` parent).
+
+### 31.9 Let telemetry agents publish without the E2E suite
+
+Write the Event Hub connection string the E2E suite would write into the authority Vault (value from `LocalEndToEndTests.EVENT_HUB_CONNECTION_STRING_SECRET`):
+
+```bash
+curl -s -X POST -H 'X-Vault-Token: root' -H 'Content-Type: application/json' \
+  http://localhost/authority/vault/v1/secret/data/event-hub-connection-string \
+  -d '{"data":{"content":"Endpoint=sb://eventhubs;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"}}'
+```
+
+### 31.10 Change how often the federated catalog crawls
+
+`modules/authority/catalog.tf`, locals `crawler_initial_delay` and `crawler_execution_period` (seconds). Apply with Terraform.
+
+### 31.11 Pin what is unpinned
+
+- Base image: `gradle.properties` `baseImage=centos:stream9` (or a digest), then rebuild.
+- ingress-nginx: replace `main` in the script's URL with a release tag (`controller-v1.15.1`).
+- Vault job image: `image = "hashicorp/vault:1.17.2"` in the two jobs of `modules/vault/main.tf`.
+- Terraform kubernetes provider: add a `version` constraint in `providers.tf`.
+
+### 31.12 Deploy a single participant against an existing dataspace
+
+Rename `modules/participant/standalone-providers.tf.disabled` to `.tf`, write a `terraform.tfvars` in that folder with `participant_name`, the four image variables, `kube_context`, `kube_config_path`, `environment = "selfhosted"` and `charts_path = "../../../charts"`, then run Terraform from there. The `selfhosted_did_url`, `selfhosted_sts_url` and `selfhosted_authority_did` variables let that participant use real public URLs instead of in-cluster names (section 16).
+
+---
+
+## 32. Further reading
 
 - kind: https://kind.sigs.k8s.io
 - ingress-nginx: https://kubernetes.github.io/ingress-nginx/
@@ -839,4 +1385,4 @@ The devbox runbooks deal with the same weak points described in this report (job
 - Eclipse Dataspace Components: https://github.com/eclipse-edc
 - Azure Event Hubs emulator: https://github.com/Azure/azure-event-hubs-emulator-installer
 - Azurite: https://github.com/Azure/Azurite
-- Upstream repository docs: `~/deploytour-local/dataspace-ecosystem/docs/` (architecture, billing, onboarding, developer guide)
+- Upstream repository docs: `ging_deploy/dataspace-ecosystem/docs/` (architecture, billing, onboarding, developer guide)

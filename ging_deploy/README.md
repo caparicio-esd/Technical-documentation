@@ -12,6 +12,16 @@ source ./rc.sh
 
 What you can do once it's up (onboarding, publishing, catalog, negotiation, transfers, billing) is listed in [FLOWS.md](FLOWS.md). To run it all step by step: `cd tutorial && ./run.sh` opens the [tutorial notebooks](tutorial/README.md) (one per block, 00–07, plus the `08_explorer` playground) in JupyterLab. Every API is also in the [Postman collection](postman/README.md). Diagrams and glossary are in [DIAGRAMS.md](DIAGRAMS.md); the technology deep dive is [DEPLOYMENT-REPORT.md](DEPLOYMENT-REPORT.md).
 
+The upstream repo (Terraform in `system-tests/`, Helm charts in `charts/`, Dockerfiles in `launchers/`) is the git submodule `ging_deploy/dataspace-ecosystem`, pinned to the commit this setup was validated with. This repo stores only a pointer to it (URL + commit in `.gitmodules`), not its files:
+
+```bash
+git clone --recurse-submodules <this repo>        # or, in an existing clone: git submodule update --init
+git -C ging_deploy/dataspace-ecosystem log -1     # the pinned commit
+git submodule update --remote ging_deploy/dataspace-ecosystem && git add ging_deploy/dataspace-ecosystem   # move the pin to upstream's latest
+```
+
+The script never pulls it: a new upstream commit is used only after you move the pin. Build output and Terraform state inside it are ignored by this repo's `git status` (`ignore = dirty`).
+
 Host requirements: Docker, kind, kubectl, Terraform, git. No host JDK is needed: Gradle runs inside `eclipse-temurin:17-jdk`. A host JDK is only needed for `RUN_E2E_TESTS=true`.
 
 ---

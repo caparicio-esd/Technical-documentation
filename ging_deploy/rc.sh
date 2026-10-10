@@ -7,8 +7,13 @@
 # Every value here also has the same default inside deploy-local-mvd.sh,
 # so only change what you want to override.
 
-# Where the dataspace-ecosystem and Dataspace_UI repos get cloned (plus logs and port-forward PIDs)
+# Logs, port-forward PIDs, the generated kind config and the Dataspace_UI clone live here
 export WORKDIR="$HOME/deploytour-local"
+
+# Upstream repo (Terraform, Helm charts, Dockerfiles). By default the script uses the git submodule
+# ging_deploy/dataspace-ecosystem (pinned commit, never pulled) and only clones MVD_REPO_URL into
+# $WORKDIR when the submodule folder is missing. Uncomment to force another checkout:
+# export MVD_DIR="$HOME/deploytour-local/dataspace-ecosystem"
 
 # Source repositories
 export MVD_REPO_URL="https://github.com/AmadeusITGroup/dataspace-ecosystem.git"

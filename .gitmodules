@@ -1,0 +1,4 @@
+[submodule "ging_deploy/dataspace-ecosystem"]
+	path = ging_deploy/dataspace-ecosystem
+	url = https://github.com/AmadeusITGroup/dataspace-ecosystem.git
+	ignore = dirty

@@ -46,7 +46,16 @@ BUILD_IN_CONTAINER="${BUILD_IN_CONTAINER:-true}"
 GRADLE_BUILD_IMAGE="${GRADLE_BUILD_IMAGE:-eclipse-temurin:17-jdk}"
 
 # Derived paths
-MVD_DIR="$WORKDIR/dataspace-ecosystem"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Upstream repo: the git submodule next to this script if it exists (pinned commit),
+# otherwise a plain clone under $WORKDIR. MVD_DIR can be forced from rc.sh.
+if [ -z "${MVD_DIR:-}" ]; then
+  if [ -d "$SCRIPT_DIR/dataspace-ecosystem" ]; then
+    MVD_DIR="$SCRIPT_DIR/dataspace-ecosystem"
+  else
+    MVD_DIR="$WORKDIR/dataspace-ecosystem"
+  fi
+fi
 UI_DIR="$WORKDIR/Dataspace_UI"
 PF_DIR="$WORKDIR/.pf"        # port-forward PIDs and logs
 LOG_DIR="$WORKDIR/logs"      # build/terraform logs
@@ -137,10 +146,26 @@ check_java() {
   log "Using JDK $version (${JAVA_HOME:-system java})"
 }
 
+# The upstream repo as a git submodule: initialise it if it is empty, never pull
+# (the parent repo pins the commit; move it with `git submodule update --remote`).
+ensure_mvd_repo() {
+  local superproject
+  superproject="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ "$MVD_DIR" = "$SCRIPT_DIR/dataspace-ecosystem" ] && [ -n "$superproject" ]; then
+    if [ ! -e "$MVD_DIR/.git" ]; then
+      log "Initialising submodule ging_deploy/dataspace-ecosystem..."
+      git -C "$superproject" submodule update --init ging_deploy/dataspace-ecosystem
+    fi
+    log "Using submodule $MVD_DIR at $(git -C "$MVD_DIR" rev-parse --short HEAD) (pinned, not pulled)"
+  else
+    clone_or_update "$MVD_REPO_URL" "$MVD_DIR" "dataspace-ecosystem"
+  fi
+}
+
 # Clone the repo if missing; otherwise try a fast-forward pull without overwriting local changes
 clone_or_update() {
   local url="$1" dir="$2" name="$3"
-  if [ -d "$dir/.git" ]; then
+  if [ -e "$dir/.git" ]; then
     log "$name already present at $dir, pulling latest..."
     git -C "$dir" pull --ff-only || warn "$name: pull failed (local changes?), using existing checkout"
   else
@@ -365,7 +390,7 @@ start_ui() {
 # ---------------------------------------------------------------------------
 cmd_up() {
   check_prereqs
-  clone_or_update "$MVD_REPO_URL" "$MVD_DIR" "dataspace-ecosystem"
+  ensure_mvd_repo
   ensure_kind_cluster
   install_ingress_nginx
   build_and_load_images

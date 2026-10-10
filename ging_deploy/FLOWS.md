@@ -298,7 +298,7 @@ Without the E2E suite, nothing moves events from Event Hub into telemetry storag
 | G1 | **Read / write Vault secrets** | `curl -H 'X-Vault-Token: root' $B/<p>/vault/v1/secret/metadata?list=true`, `.../v1/secret/data/<key>`. Each Vault holds `<p>` (private key), `<p>-pub`, `<p>-aes`, `<did>-apikey`, `<did>-sts-client-secret` | curl |
 | G2 | **Query the databases** | `kubectl exec postgresql-0 -- psql -U postgres -d <authoritydb\|providerdb\|consumerdb\|billingdb>`, or `localhost:57521` while the port-forward runs. Useful tables: `edc_issuance_process`, `keypair_resource`, `participant_context` | curl |
 | G3 | **Follow a flow in the logs** | `kubectl logs -f deploy/consumer-controlplane` (negotiation), `deploy/provider-dataplane` (transfer), `deploy/authority-issuerservice` (issuance), `deploy/authority-telemetryservice` | — |
-| G4 | **Run the full E2E suite** | `JAVA_HOME=<JDK 17> TLS_ENABLED=false ./gradlew :system-tests:runner:test -DincludeTags=EndToEndTest -Dtls.enabled=false` from `~/deploytour-local/dataspace-ecosystem` (port-forwards must be up). **Once per deployment**: reset with `down` + `up` | done |
+| G4 | **Run the full E2E suite** | `JAVA_HOME=<JDK 17> TLS_ENABLED=false ./gradlew :system-tests:runner:test -DincludeTags=EndToEndTest -Dtls.enabled=false` from `ging_deploy/dataspace-ecosystem` (port-forwards must be up). **Once per deployment**: reset with `down` + `up` | done |
 | G5 | **Status by participant** | `./deploy-local-mvd.sh status` | done |
 | G6 | **Reset everything** | `./deploy-local-mvd.sh down && ./deploy-local-mvd.sh up` | done |
 
